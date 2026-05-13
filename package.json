@@ -1,0 +1,16 @@
+{
+  "name": "spar-dashboard-runtime",
+  "version": "1.0.0",
+  "description": "Spar dashboard rendering runtime",
+  "license": "MIT",
+  "main": "spar-dash-render.mcp.min.js",
+  "files": [
+    "spar-dash-render.js",
+    "spar-dash-render.mcp.min.js",
+    "spar-dash-transform.js",
+    "spar-dash-transform.mcp.min.js",
+    "spar-dash.mcp.min.css",
+    "LICENSE",
+    "README.md"
+  ]
+}
