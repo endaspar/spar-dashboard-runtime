@@ -874,6 +874,82 @@
     return wrap;
   }
 
+  /* ── Data-fetch error card ─────────────────────────────────────────────
+     Rendered when the initial `Promise.all(/api/data/...)` boot fetch
+     fails. Replaces what used to be a single-line red `<p>` collapse with
+     a structured diagnostic block: failed query name, endpoint URL,
+     Athena error message + (line:col) when parseable, bound params, and
+     a collapsible SQL viewer.
+
+     Pulls structured data from `err.sparDebug.payload` (attached by the
+     boot script's `fetchQuery` wrapper) — present only when the server
+     populated it (preview-token / cookie / admin caller). For non-author
+     callers `payload` carries just `{ error }` and the card degrades to
+     the minimal "title + message" layout. */
+  function buildDataErrorCard(err) {
+    var msg = (err && err.message) ? err.message : String(err);
+    var dbg = err && err.sparDebug ? err.sparDebug : null;
+    var payload = (dbg && dbg.payload) || null;
+
+    var root = document.createElement('div');
+    root.className = 'spar-data-error';
+
+    var title = document.createElement('div');
+    title.className = 'spar-data-error__title';
+    title.textContent = 'Failed to load data';
+    root.appendChild(title);
+
+    var msgEl = document.createElement('pre');
+    msgEl.className = 'spar-data-error__msg';
+    msgEl.textContent = msg;
+    root.appendChild(msgEl);
+
+    var meta = document.createElement('dl');
+    meta.className = 'spar-data-error__meta';
+    function addMetaRow(label, valueEl) {
+      var dt = document.createElement('dt');
+      dt.textContent = label;
+      var dd = document.createElement('dd');
+      dd.appendChild(valueEl);
+      meta.appendChild(dt);
+      meta.appendChild(dd);
+    }
+    function asCode(text) {
+      var c = document.createElement('code');
+      c.textContent = text;
+      return c;
+    }
+    if (payload && payload.query_name) addMetaRow('Query', asCode(payload.query_name));
+    var endpoint = (payload && payload.endpoint) || (dbg && dbg.url) || null;
+    if (endpoint) addMetaRow('Endpoint', asCode(endpoint));
+    if (payload && payload.error_location) {
+      addMetaRow(
+        'Location',
+        asCode('line ' + payload.error_location.line + ':' + payload.error_location.column),
+      );
+    }
+    if (payload && payload.params_bound && Object.keys(payload.params_bound).length > 0) {
+      var paramsPre = document.createElement('pre');
+      paramsPre.textContent = JSON.stringify(payload.params_bound, null, 2);
+      addMetaRow('Params', paramsPre);
+    }
+    if (meta.children.length > 0) root.appendChild(meta);
+
+    if (payload && typeof payload.sql === 'string' && payload.sql.length > 0) {
+      var details = document.createElement('details');
+      details.className = 'spar-data-error__sql';
+      var summary = document.createElement('summary');
+      summary.textContent = 'Show SQL (' + payload.sql.length + ' chars)';
+      details.appendChild(summary);
+      var sqlPre = document.createElement('pre');
+      sqlPre.textContent = payload.sql;
+      details.appendChild(sqlPre);
+      root.appendChild(details);
+    }
+
+    return root;
+  }
+
   /**
    * @param {object} manifest - dashboard.manifest.v1
    * @param {{ mode: 'preview'|'live', data?: object, fetch?: (queryName: string, queryString: string) => Promise<{rows: object[]}>, mount?: Element|string, dashboardKey?: string }} options
@@ -1770,10 +1846,8 @@
         .catch(function (err) {
           state.loadingInitial = false;
           if (initialBoot) {
-            mount.innerHTML =
-              '<p style="color:var(--spar-error);padding:12px">Failed to load data: ' +
-              (err && err.message ? err.message : String(err)) +
-              '</p>';
+            mount.innerHTML = '';
+            mount.appendChild(buildDataErrorCard(err));
           } else {
             console.error('[SPAR] live data refresh failed:', err);
           }
