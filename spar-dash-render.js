@@ -787,6 +787,10 @@
           }
           return base;
         });
+        /* Bail if the body host was already replaced (e.g., a fast-arriving
+           second progressive update for this widget). Without this we'd
+           construct an AG Grid on a detached host and leak its handle. */
+        if (!wrap.isConnected) return;
         agGrid.createGrid(host, {
           columnDefs: colDefs,
           rowData: rows,
@@ -812,7 +816,9 @@
           suppressColumnVirtualisation: true,
           animateRows: true,
           onGridReady: function (e) {
-            state.grids.push({ destroy: function () { e.api.destroy(); } });
+            state.gridByWidget[widget.id] = {
+              destroy: function () { e.api.destroy(); },
+            };
             /* CSV export via right-click. AG Grid v31 Community has no
                built-in context menu (that's Enterprise) but `exportDataAsCsv`
                IS available — so we suppress the browser default menu on the
@@ -859,9 +865,13 @@
       wrap.appendChild(chartRoot);
       queueMicrotask(function () {
         if (!rows.length && widget.type !== 'pie') return;
+        /* Bail if the body host was already replaced (e.g., a fast-arriving
+           second progressive update for this widget). Without this we'd
+           construct a Chart.js instance on a detached canvas and leak it. */
+        if (!wrap.isConnected) return;
         var cfg = buildChartConfiguration(widget, rows, chartRoot, state.paramState);
         var ch = new Chart(canvas, cfg);
-        state.charts.push(ch);
+        state.chartByWidget[widget.id] = ch;
       });
       return wrap;
     }
@@ -950,6 +960,32 @@
     return root;
   }
 
+  /* Per-widget error body — rendered inline INSIDE a widget section when
+     `renderWidgetBody` throws, so the rest of the dashboard keeps rendering.
+     Names the widget id + type so the author can find the offending entry
+     in the manifest without expanding a minified stack trace. The thrown
+     error message is the leaf; in dev the full stack is on the console. */
+  function buildWidgetErrorBody(widget, err) {
+    var body = document.createElement('div');
+    body.className = 'spar-widget-error';
+    var head = document.createElement('div');
+    head.className = 'spar-widget-error__head';
+    head.textContent = 'Widget render error';
+    body.appendChild(head);
+    var meta = document.createElement('div');
+    meta.className = 'spar-widget-error__meta';
+    meta.textContent =
+      (widget && widget.id ? widget.id : '?') +
+      ' · ' +
+      (widget && widget.type ? widget.type : 'unknown');
+    body.appendChild(meta);
+    var msg = document.createElement('pre');
+    msg.className = 'spar-widget-error__msg';
+    msg.textContent = err && err.message ? err.message : String(err);
+    body.appendChild(msg);
+    return body;
+  }
+
   /**
    * @param {object} manifest - dashboard.manifest.v1
    * @param {{ mode: 'preview'|'live', data?: object, fetch?: (queryName: string, queryString: string) => Promise<{rows: object[]}>, mount?: Element|string, dashboardKey?: string }} options
@@ -983,8 +1019,22 @@
     var agGrid = global.agGrid;
 
     var state = {
-      charts: [],
-      grids: [],
+      /* Chart.js / AG Grid instances keyed by widget id rather than a flat
+         array so a single query's progressive update can destroy + rebuild
+         JUST the widgets bound to that query, leaving siblings untouched
+         (their Chart.js animations and AG Grid scroll/sort/selection state
+         survive). Reset wholesale by `destroyChartsAndGrids` on tab change
+         / full rebuild; per-widget destroy uses `destroyChartGridForWidget`. */
+      chartByWidget: {},
+      gridByWidget: {},
+      /* widget id -> the inner <div> that holds the widget's body content
+         (Loading placeholder, error tile, chart canvas, AG Grid host, KPI
+         block, or markdown). Populated by `renderWidgetsInto` once per
+         widget section. Per-query progressive updates wipe + repopulate
+         JUST these hosts via `replaceWidgetBody`, so the surrounding
+         section chrome (header bar, layout slot, borders) is never
+         touched and the grid never reflows. */
+      widgetBodyHosts: {},
       root: null,
       paramState: {},
       widgetsHost: null,
@@ -996,6 +1046,22 @@
          popover state, user-typed text in adjacent text controls, and
          tab/scroll position. Map is reset on every buildDom call. */
       controlRefreshers: {},
+      /* Per-query progressive-render state.
+         - `loadedQueries[q] = 1` once that query's `/api/data` round-trip has
+           SETTLED (success OR failure) at least once. Used by
+           `renderWidgetsInto` to flip a widget OUT of the "Loading…"
+           placeholder as soon as its source query lands — even while sibling
+           queries are still in flight. Survives across reloads so a control
+           change shows stale-while-revalidating instead of flashing every
+           widget back to "Loading…".
+         - `queryErrors[q]` holds the most recent fetch / parse error for
+           query `q` (or `null` after a subsequent success). Widgets bound
+           to a query with a non-null error render `buildWidgetErrorBody`
+           in their tile so partial failures stay scoped — `mount.innerHTML`
+           is NEVER wiped for a fetch error any more (which was the loop
+           fuel before). */
+      loadedQueries: {},
+      queryErrors: {},
     };
     var lastDataByQuery = {};
     var activeTabId = manifest.tabs[0] ? manifest.tabs[0].id : 'main';
@@ -1043,16 +1109,83 @@
     }
 
     function destroyChartsAndGrids() {
-      state.charts.forEach(function (c) { try { c.destroy(); } catch (e) {} });
-      state.charts = [];
-      state.grids.forEach(function (g) {
-        try { if (g && typeof g.destroy === 'function') g.destroy(); } catch (e2) {}
+      Object.keys(state.chartByWidget).forEach(function (id) {
+        try { state.chartByWidget[id].destroy(); } catch (e) {}
       });
-      state.grids = [];
+      state.chartByWidget = {};
+      Object.keys(state.gridByWidget).forEach(function (id) {
+        try {
+          var g = state.gridByWidget[id];
+          if (g && typeof g.destroy === 'function') g.destroy();
+        } catch (e2) {}
+      });
+      state.gridByWidget = {};
+    }
+
+    /* Destroy the Chart.js / AG Grid instance for a SINGLE widget (if it
+       has one). Used by `replaceWidgetBody` so a per-query progressive
+       update doesn't tear down sibling widgets' instances — which would
+       reset their scroll position, sort order, and replay Chart.js
+       animations even though their data hasn't changed. */
+    function destroyChartGridForWidget(widgetId) {
+      var c = state.chartByWidget[widgetId];
+      if (c) {
+        try { c.destroy(); } catch (e) {}
+        delete state.chartByWidget[widgetId];
+      }
+      var g = state.gridByWidget[widgetId];
+      if (g) {
+        try { if (typeof g.destroy === 'function') g.destroy(); } catch (e2) {}
+        delete state.gridByWidget[widgetId];
+      }
+    }
+
+    /* Render the contents of a single widget's body host (loading
+       placeholder, error tile, or real body) based on its CURRENT
+       per-query state. The surrounding section, header bar, and grid
+       layout are untouched — only `host.innerHTML` and the chart / grid
+       instance for THIS widget get replaced. Used both for initial
+       paint inside `renderWidgetsInto` and for per-query progressive
+       updates via `updateWidgetsForQuery`. */
+    function replaceWidgetBody(w, host) {
+      destroyChartGridForWidget(w.id);
+      host.innerHTML = '';
+      var queryName = w.query;
+      var queryErr = queryName ? state.queryErrors[queryName] : null;
+      var isLoading = !!queryName && !state.loadedQueries[queryName];
+      if (queryErr) {
+        host.appendChild(buildWidgetErrorBody(w, queryErr));
+        return;
+      }
+      if (isLoading) {
+        var loadingBody = document.createElement('div');
+        loadingBody.className = 'spar-widget-loading';
+        loadingBody.className += ' spar-eng-loading-body';
+        loadingBody.textContent = 'Loading\u2026';
+        host.appendChild(loadingBody);
+        return;
+      }
+      var rows = widgetRows(w, lastDataByQuery, applyTransformPipeline, state.paramState);
+      /* Per-widget try/catch so a single broken widget (bad encoding,
+         missing column in the row shape, malformed transform output) does
+         NOT propagate up to the reloadLiveData .catch — which would wipe
+         the entire mount and, combined with any control that schedules a
+         rerender at init, kick off a render-error → mount-wipe → rebuild
+         reload loop. Each broken widget shows an inline error card that
+         names the widget id + type so the author can pinpoint the bad
+         definition without re-binding devtools to a minified bundle. */
+      try {
+        var body = renderWidgetBody(w, rows, state, applyTransformPipeline, Chart, agGrid);
+        host.appendChild(body);
+      } catch (widgetErr) {
+        console.error('[SPAR] widget render failed:', w.id, w.type, widgetErr);
+        host.appendChild(buildWidgetErrorBody(w, widgetErr));
+      }
     }
 
     function renderWidgetsInto(grid, dataByQuery) {
       destroyChartsAndGrids();
+      state.widgetBodyHosts = {};
       grid.innerHTML = '';
       var tab = manifest.tabs.find(function (x) { return x.id === activeTabId; });
       var layout = (tab && tab.layout) || [];
@@ -1062,16 +1195,6 @@
         (function(slot) {
         var w = widgetById[slot.widget];
         if (!w) return;
-        /* In live mode we paint the chrome before the first /api/data
-           round-trip resolves (state.loadingInitial=true); skip the data
-           pipeline for data-backed widgets and render a "Loading…"
-           placeholder so users see the dashboard structure immediately
-           instead of a blank iframe. Markdown widgets without a `query`
-           render normally — their content lives in the manifest. */
-        var isLoading = !!(state.loadingInitial && w.query);
-        var rows = isLoading
-          ? []
-          : widgetRows(w, dataByQuery, applyTransformPipeline, state.paramState);
         var sec = document.createElement('section');
         /* Tables: drop `.spar-card` entirely — AG Grid renders its own
            outer border, background, and chrome, so any card chrome on the
@@ -1114,24 +1237,55 @@
           head.appendChild(titleWrap);
           sec.appendChild(head);
         }
-        if (isLoading) {
-          /* Keep the section-header bar (when applicable) so the title
-             stays visible; replace the body with a centered, pulsing
-             "Loading…" placeholder. KPIs have no header bar — the loading
-             body fills the whole card, mirroring the final KPI layout. */
-          var loadingBody = document.createElement('div');
-          loadingBody.className = 'spar-widget-loading';
-          loadingBody.className += ' spar-eng-loading-body';
-          loadingBody.textContent = 'Loading\u2026';
-          sec.appendChild(loadingBody);
-          grid.appendChild(sec);
-          return;
-        }
-        var body = renderWidgetBody(w, rows, state, applyTransformPipeline, Chart, agGrid);
-        sec.appendChild(body);
+        /* Stable body host: created once per widget here, then targeted
+           by `updateWidgetsForQuery` on per-query progressive updates so
+           we never destroy + recreate the surrounding `<section>`. */
+        var bodyHost = document.createElement('div');
+        bodyHost.className = 'spar-eng-widget-body';
+        bodyHost.style.cssText = 'flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden;';
+        sec.appendChild(bodyHost);
+        state.widgetBodyHosts[w.id] = bodyHost;
+        replaceWidgetBody(w, bodyHost);
         grid.appendChild(sec);
         })(layout[i]);
       }
+    }
+
+    /* Per-query progressive update. Re-renders ONLY the widgets whose
+       `w.query === queryName` (and refreshes any dynamic-options control
+       sourced from that query). Sibling widgets bound to other queries —
+       and any Chart.js animations / AG Grid scroll / sort / selection
+       state they hold — are left completely untouched. Called by
+       `reloadLiveData` once per query as each `/api/data/<q>` response
+       lands.
+    
+       Falls back to a full `renderWidgetsInto` rebuild if the widget body
+       host map is empty (e.g., the surrounding chrome was torn down by a
+       tab change while a fetch was still in flight). */
+    function updateWidgetsForQuery(queryName) {
+      var hostMap = state.widgetBodyHosts;
+      var haveHosts = hostMap && Object.keys(hostMap).length > 0;
+      if (!haveHosts) {
+        if (state.widgetsHost && state.widgetsHost.isConnected) {
+          renderWidgetsInto(state.widgetsHost, lastDataByQuery);
+          refreshDynamicControls();
+        } else {
+          buildDom(lastDataByQuery);
+        }
+        return;
+      }
+      manifest.widgets.forEach(function (w) {
+        if (w.query !== queryName) return;
+        var host = hostMap[w.id];
+        if (!host || !host.isConnected) return;
+        replaceWidgetBody(w, host);
+      });
+      /* Refresh any dynamic-options dropdown — they all read from
+         `lastDataByQuery` and are cheap (just rebuild `<option>` children
+         in place). Calling them per-query-landing keeps multiselect
+         popovers / focused text inputs intact while still letting their
+         options populate as their source query arrives. */
+      refreshDynamicControls();
     }
 
     /* Resolve a control's effective options list — dynamic (options_from)
@@ -1325,7 +1479,23 @@
 
       seedFromState();
       rebuildList();
-      if (ctrl.param) commit();
+      /* Sync paramState with the initial `selected` set WITHOUT calling
+         commit() at init — commit() schedules a rerender, which in live mode
+         re-fetches every /api/data query. The live-mode boot below (see
+         `(manifest.controls || []).forEach`) already pre-seeds paramState
+         from `ctrl.default`, so the scheduled fetch would be both redundant
+         AND open the door to a runaway reload loop: if any widget's first
+         render throws (e.g. an encoding referencing a field the SQL didn't
+         return), the boot `.catch` wipes `mount.innerHTML` → widgetsHost
+         disconnects → next reload's `.then` falls back to `buildDom` →
+         buildMultiselectDropdown runs again → another scheduleRerender →
+         another reload, forever (~80 Hz, matches a rAF cadence). Writing
+         paramState directly here keeps the seed-from-default semantics
+         (relevant in preview mode where `c.default` isn't pre-applied) and
+         removes the rerender side-effect entirely. */
+      if (ctrl.param) {
+        state.paramState[ctrl.param] = Object.keys(selected).join(',');
+      }
 
       function offClick(ev) {
         if (!wrap.contains(ev.target)) {
@@ -1771,6 +1941,14 @@
           }
         });
       }
+      /* Preview mode has all rows up front — mark every query as "loaded"
+         so `renderWidgetsInto`'s per-widget Loading…/error/data branch
+         takes the data path (without this, widgets would stay stuck on
+         "Loading…" forever because `state.loadedQueries` is empty in
+         preview). */
+      Object.keys(dataByQuery).forEach(function (q) {
+        state.loadedQueries[q] = 1;
+      });
       buildDom(dataByQuery);
       return;
     }
@@ -1806,61 +1984,78 @@
     var queries = allManifestQueryNames(manifest);
     var initialBoot = true;
 
-    /* Fetch every query with the current `paramState` and re-render. Called
-       once on boot, then again on every control change via `scheduleRerender`
-       (which delegates to this in live mode). On a re-fetch failure we keep
-       the previous render visible and log; only the initial boot collapses
-       the mount to an error message. */
+    /* Per-query progressive fetch. Each `/api/data/<q>` round-trip fires
+       independently — a widget bound to query A renders as soon as A returns,
+       even while B and C are still in flight. Previously the whole grid
+       waited for the slowest query (`Promise.all`), which on dashboards
+       with one heavy master + several light siblings froze every tile in
+       "Loading…" for the duration of the slow one.
+
+       When a query lands we call `updateWidgetsForQuery(q)`, which
+       re-renders ONLY the widgets bound to that query — sibling widgets
+       backed by other queries keep their existing Chart.js animations,
+       AG Grid scroll/sort/selection state, and DOM nodes untouched. The
+       earlier rAF-coalesced full-grid rebuild had a visible regression
+       where widgets 1+2 (from query A) re-rendered when query B landed
+       for widget 3.
+
+       Failures are recorded per-query in `state.queryErrors[q]`:
+       the per-widget render path then shows `buildWidgetErrorBody` in
+       just the affected widgets while the rest of the dashboard renders
+       normally — and crucially the mount is NEVER wiped, so a fetch
+       error can't feed a render-error → mount-wipe → rebuild loop the
+       way `Promise.all`'s shared `.catch` used to.
+
+       Called once on boot, then again on every control change via
+       `scheduleRerender` (which delegates to this in live mode). On a
+       refetch the existing rows stay visible until the new ones arrive
+       (stale-while-revalidate) — `loadedQueries` is intentionally not
+       reset, only `queryErrors` is cleared per-query on the next success. */
     function reloadLiveData() {
-      return Promise.all(
-        queries.map(function (q) {
+      if (queries.length === 0) {
+        initialBoot = false;
+        return Promise.resolve();
+      }
+      var pending = queries.length;
+      return new Promise(function (resolve) {
+        queries.forEach(function (q) {
           var qs = buildSearchParamsForQuery(q, manifest, state.paramState);
-          return Promise.resolve(fetchFn(q, qs)).then(function (j) {
-            return [q, (j && j.rows) || []];
-          });
-        }),
-      )
-        .then(function (entries) {
-          state.loadingInitial = false;
-          var dataByQuery = {};
-          entries.forEach(function (pair) {
-            dataByQuery[pair[0]] = pair[1];
-          });
-          lastDataByQuery = dataByQuery;
-          if (state.widgetsHost && state.widgetsHost.isConnected) {
-            renderWidgetsInto(state.widgetsHost, dataByQuery);
-            /* Re-resolve every dynamic-options control against the new
-               data. `buildDom` is intentionally NOT called here so the
-               controls bar (and any open multiselect popover, focused
-               text input, scroll position) is left intact — the
-               refreshers update <option> children and popover lists in
-               place. On the very first fetch the controls bar was built
-               by the earlier `buildDom({})` chrome paint, so the
-               refreshers find existing DOM nodes to update. */
-            refreshDynamicControls();
-          } else {
-            buildDom(dataByQuery);
-          }
-          initialBoot = false;
-        })
-        .catch(function (err) {
-          state.loadingInitial = false;
-          if (initialBoot) {
-            mount.innerHTML = '';
-            mount.appendChild(buildDataErrorCard(err));
-          } else {
-            console.error('[SPAR] live data refresh failed:', err);
-          }
+          Promise.resolve()
+            .then(function () { return fetchFn(q, qs); })
+            .then(
+              function (j) {
+                lastDataByQuery[q] = (j && j.rows) || [];
+                state.queryErrors[q] = null;
+              },
+              function (err) {
+                /* Keep any previously-loaded rows visible (stale data is
+                   better than a sudden blank tile during a refetch) — the
+                   widget tile just flips to the error body until a future
+                   successful fetch clears it. */
+                state.queryErrors[q] = err;
+                console.warn('[SPAR] query failed:', q, err);
+              },
+            )
+            .then(function () {
+              state.loadedQueries[q] = 1;
+              updateWidgetsForQuery(q);
+              pending--;
+              if (pending === 0) {
+                initialBoot = false;
+                resolve();
+              }
+            });
         });
+      });
     }
     state.reloadLiveData = reloadLiveData;
     /* Paint the chrome (header, controls, tabs, widget skeletons) BEFORE
        the first /api/data round-trip — otherwise the iframe stays blank
-       for the full duration of the slowest query. `state.loadingInitial`
-       routes data-backed widgets through the "Loading…" placeholder body
-       in `renderWidgetsInto`; reloadLiveData clears the flag and re-renders
-       widgets in place once data arrives. */
-    state.loadingInitial = true;
+       for the full duration of the slowest query. Widgets whose `query`
+       isn't in `state.loadedQueries` yet route through the "Loading…"
+       placeholder body in `renderWidgetsInto`; each per-query progressive
+       update flips the corresponding widgets to their real bodies as soon
+       as the row payload lands. */
     buildDom({});
     reloadLiveData();
   }

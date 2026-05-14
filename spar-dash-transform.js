@@ -100,6 +100,34 @@
     return out;
   }
 
+  /* Keep in sync with `assertNonEmptyStringArray` in
+     src/lib/spar-dash-engine/transform.ts. `group_by` and `select` both
+     used to read `op.fields` blind and immediately call `.map(...)` /
+     `.length` on it — a missing or non-array `fields` would crash with
+     `Cannot read properties of undefined (reading 'map')`, take out the
+     entire widget render, and (before per-widget error containment
+     existed in the engine) put the dashboard into a re-render loop.
+     Now we throw a STRUCTURED error so `buildWidgetErrorBody` can point
+     the author straight at the offending op in `transform[i]`. */
+  function assertNonEmptyStringArray(value, opLabel, index, fieldName) {
+    var ok = false;
+    if (Array.isArray(value) && value.length > 0) {
+      ok = true;
+      for (var i = 0; i < value.length; i++) {
+        if (typeof value[i] !== 'string') {
+          ok = false;
+          break;
+        }
+      }
+    }
+    if (!ok) {
+      throw new Error(
+        "Bad " + opLabel + " op at transform[" + index + "]: '" + fieldName +
+          "' must be a non-empty string[] (got " + JSON.stringify(value) + ')',
+      );
+    }
+  }
+
   function applyAgg(rows, field, agg) {
     var vals = rows
       .map(function (r) {
@@ -201,11 +229,18 @@
           });
           break;
         case 'select':
+          assertNonEmptyStringArray(op.fields, 'select', i, 'fields');
           out = out.map(function (r) {
             return pickRow(r, op.fields);
           });
           break;
         case 'sort': {
+          if (typeof op.field !== 'string' || !op.field) {
+            throw new Error(
+              "Bad sort op at transform[" + i + "]: 'field' must be a non-empty string (got " +
+                JSON.stringify(op.field) + ')',
+            );
+          }
           var dir = op.dir === 'asc' ? 1 : -1;
           var f = op.field;
           out = out.slice().sort(function (a, b) {
@@ -219,6 +254,7 @@
           break;
         }
         case 'group_by': {
+          assertNonEmptyStringArray(op.fields, 'group_by', i, 'fields');
           var next = ops[i + 1];
           if (next && typeof next === 'object' && next.op === 'aggregate') {
             var raw = Object.assign({}, next);
